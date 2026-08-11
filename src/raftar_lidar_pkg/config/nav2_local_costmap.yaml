@@ -1,30 +1,42 @@
+# ===========================================================================
+# Nav2 configuration for the Raftaar rover
+# ===========================================================================
+# Only the local half of Nav2 is used: a costmap that remembers what the
+# LiDARs just saw, and a controller that steers around it.  There is no map
+# server, no AMCL and no global planner - the mission itself comes from
+# ArduPilot, and this stack only handles the detour.
+#
+# Numbers marked "must match" appear in more than one place because Nav2
+# requires it.  Keep them in step.
+# ===========================================================================
+
 local_costmap:
   local_costmap:
     ros__parameters:
-      # Costmap update frequency
       update_frequency: 5.0
       publish_frequency: 2.0
 
-      # Frame setup
-      global_frame: map            # matches MAVROS odometry frame_id and coordinator TF
-      robot_base_frame: base_link  # rover center reference
+      # 'map' is the fixed frame; 'base_link' is the rover.  The chain
+      # map -> odom -> base_link is published by the launch file (static)
+      # and coordinator_node (live).
+      global_frame: map
+      robot_base_frame: base_link
 
-      # Costmap size around the rover (20x20 meters window for large vehicle)
+      # A 20x20 m window that slides along with the rover.  Nothing outside
+      # it is remembered, which is exactly what "local only" means.
+      rolling_window: true
       width: 20
       height: 20
-      resolution: 0.05            # 5cm per cell
+      resolution: 0.05             # 5 cm per cell
 
-      # Rolling window follows the rover
-      rolling_window: true
-
-      # Rover footprint: 2.19m long x 2.10m wide
-      # Half-length=1.095m, half-width=1.05m
-      # Polygon: front-right, front-left, rear-left, rear-right (counter-clockwise)
+      # Rover outline, 2.19 m long x 2.10 m wide, in base_link.
       footprint: "[[1.095, 1.05], [1.095, -1.05], [-1.095, -1.05], [-1.095, 1.05]]"
 
-      # Obstacle inflation - rover stays at least this far from obstacles
-      # For large vehicle: half_diagonal(~1.52m) + safety_margin(0.5m) = ~2.0m
+      # Obstacles are grown by this much so the planner keeps its distance.
+      # circumscribed radius (~1.52 m) + 0.5 m margin.
       inflation_radius: 2.0
+
+      always_send_full_costmap: true
 
       plugins: ["obstacle_layer", "inflation_layer"]
 
@@ -33,9 +45,13 @@ local_costmap:
         enabled: true
         observation_sources: laser_scan_top laser_scan_low
 
+        # FIXED: this used to read /scan_top while the driver published on
+        # /scan, so the top LiDAR was invisible to the planner and every
+        # detour was made using the low LiDAR alone.  The launch file now
+        # remaps the driver onto /scan_top to match.
         laser_scan_top:
           topic: /scan_top
-          max_obstacle_height: 1.5      # top LiDAR at 1.15m + 0.35m margin
+          max_obstacle_height: 1.5      # sensor at 1.15 m + margin
           clearing: true
           marking: true
           data_type: "LaserScan"
@@ -46,7 +62,7 @@ local_costmap:
 
         laser_scan_low:
           topic: /scan_low
-          max_obstacle_height: 1.0     # low LiDAR at 0.58m + 0.42m margin
+          max_obstacle_height: 1.0      # sensor at 0.58 m + margin
           clearing: true
           marking: true
           data_type: "LaserScan"
@@ -58,15 +74,19 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 2.0          # must match above
-        cost_scaling_factor: 3.0       # how quickly cost drops with distance from obstacle
+        inflation_radius: 2.0          # must match ObstaclesCritic below
+        cost_scaling_factor: 3.0       # must match ObstaclesCritic below
 
 
-# MPPI Local Planner - smooth trajectory generation for skid-steer rover
-# Replaces DWB for better dynamic obstacle avoidance on Jetson
+# ===========================================================================
+# Controller: MPPI (Model Predictive Path Integral)
+# ===========================================================================
+# Every cycle MPPI invents a few thousand possible short futures, scores
+# each one, and blends them into a single velocity command.
+# ===========================================================================
 controller_server:
   ros__parameters:
-    controller_frequency: 20.0       # MPPI needs higher frequency for trajectory sampling
+    controller_frequency: 20.0
 
     controller_plugins: ["FollowPath"]
     progress_checker_plugin: "progress_checker"
@@ -84,56 +104,137 @@ controller_server:
       stateful: true
 
     FollowPath:
-      plugin: "mppi_controller::MPPIController"
+      # FIXED: was "mppi_controller::MPPIController", which does not exist.
+      # The class lives in the nav2_mppi_controller package, and the wrong
+      # name made controller_server fail to configure at startup.
+      plugin: "nav2_mppi_controller::MPPIController"
 
-      # Velocity bounds (skid-steer: vx=forward, wz=angular, vy=0)
-      vx_max: 0.5          # max forward speed (m/s)
-      vx_min: -0.2         # slight reverse for obstacle recovery
-      vy_max: 0.0          # skid-steer: no lateral movement
-      wz_max: 0.5          # max angular speed (rad/s) — conservative for large rover
+      # --- What the rover is physically able to do (skid-steer) ---
+      motion_model: "DiffDrive"       # forward + turn, never sideways
+      vx_max: 0.5                     # m/s forward
+      vx_min: -0.2                    # m/s, a little reverse to unstick
+      vy_max: 0.0                     # no sideways motion
+      wz_max: 0.5                     # rad/s turn rate
 
-      # Sampling noise (std dev for trajectory perturbation)
-      vx_std: 0.2          # perturbation on linear velocity
-      vy_std: 0.0          # no lateral perturbation
-      wz_std: 0.4          # perturbation on angular velocity
+      # --- How widely to explore around the current command ---
+      vx_std: 0.2
+      vy_std: 0.0
+      wz_std: 0.4
 
-      # Trajectory sampling
-      time_steps: 32       # horizon (32 steps = 3.2s at dt=0.1)
-      model_dt: 0.1        # timestep (seconds)
-      iteration_count: 4   # rollout iterations (4-10 good for skid-steer)
-      batch_size: 1        # batch size (1 = standard)
-      temperature: 0.0     # noise for exploration
-      gamma: 1.0           # discount factor
+      # --- How far ahead to look ---
+      time_steps: 32                  # 32 x 0.1 s = 3.2 s of lookahead
+      model_dt: 0.1
+      iteration_count: 1
 
-      # Critics (each scored with .scale weight)
-      critics: ["PreferForward", "PathFollowed", "PathAngle", "GoalAngle", "Obstacles"]
+      # FIXED: batch_size was 1.  That is the number of candidate futures
+      # sampled per cycle - with one sample there is nothing to choose
+      # between, and MPPI degenerates into "carry straight on".  Nav2's
+      # default is 2000.
+      batch_size: 2000
 
-      # Critic weights (.scale = importance)
-      PreferForward.scale: 1.5
-      PathFollowed.scale: 2.0
-      PathAngle.scale: 1.0
-      GoalAngle.scale: 1.0
-      Obstacles.scale: 25.0
-      Obstacles.threshold_to_consider: 0.5
-      Obstacles.cost_scaling_factor: 10.0
-      Obstacles.collision_margin_distance: 0.10
+      # FIXED: temperature 0.0 collapses the soft-max that blends the
+      # candidates; gamma 1.0 was likewise far off.  These are Nav2's
+      # tested defaults.
+      temperature: 0.3
+      gamma: 0.015
 
-      visualize: true
-      trajectory_step: 4
-      enforce_path_inversion: true
       prune_distance: 2.0
-      retry_attempt_limit: 3
       transform_tolerance: 0.5
+      reset_period: 1.0
+      regenerate_noises: false
+      visualize: false                # true costs CPU on a Jetson
+
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+
+      # --- Scoring ---
+      # FIXED: the critic names had no "Critic" suffix, so pluginlib could
+      # not load a single one of them.
+      critics: [
+        "ConstraintCritic", "ObstaclesCritic", "GoalCritic", "GoalAngleCritic",
+        "PathAlignCritic", "PathFollowCritic", "PathAngleCritic", "PreferForwardCritic"
+      ]
+
+      ConstraintCritic:            # penalises commands outside the limits above
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+
+      GoalCritic:                  # pulls toward the end of the path
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4
+
+      GoalAngleCritic:             # lines the rover up at the end
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+
+      PreferForwardCritic:         # reversing is a last resort
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+
+      ObstaclesCritic:             # the one that actually dodges things
+        enabled: true
+        cost_power: 1
+        repulsion_weight: 1.5
+        critical_weight: 20.0
+        consider_footprint: false  # inflation already exceeds the footprint
+        collision_cost: 10000.0
+        collision_margin_distance: 0.10
+        near_goal_distance: 0.5
+        inflation_radius: 2.0      # must match inflation_layer
+        cost_scaling_factor: 3.0   # must match inflation_layer
+
+      PathAlignCritic:             # stay near the straight line we were given
+        enabled: true
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+
+      PathFollowCritic:            # keep making progress along it
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+
+      PathAngleCritic:             # point roughly the right way
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        forward_preference: true
 
 
-# Velocity smoother - smooths out cmd_vel commands for skid steer
+# ===========================================================================
+# Velocity smoother
+# ===========================================================================
+# Turns step changes in commanded velocity into ramps.  A 2.19 m rover that
+# is told to go from 0 to 0.5 m/s instantly will lurch; this bounds the
+# acceleration.  Reads /cmd_vel, writes /cmd_vel_smoothed.
+#
+# This block existed before but no velocity_smoother node was ever started,
+# so it did nothing.  The launch file now runs one.
+# ===========================================================================
 velocity_smoother:
   ros__parameters:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [0.5, 0.0, 0.5]     # [x, y, theta]
-    min_velocity: [-0.5, 0.0, -0.5]
+    max_velocity: [0.5, 0.0, 0.5]      # [x, y, theta]
+    min_velocity: [-0.2, 0.0, -0.5]
     max_accel: [0.3, 0.0, 0.5]
     max_decel: [-0.3, 0.0, -0.5]
     deadband_velocity: [0.0, 0.0, 0.0]

@@ -8,6 +8,9 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
 from mavros_msgs.srv import SetMode
 
+from raftar_lidar_pkg.scan_utils import nearest_in_sector
+from raftar_lidar_pkg.rover_config import OBSTACLE_TOPIC
+
 
 class ObstacleModeSwitcher(Node):
     """
@@ -52,7 +55,7 @@ class ObstacleModeSwitcher(Node):
             self.get_logger().warn("Still waiting for /mavros/set_mode ... is mavros running & connected?")
 
         # ---- Obstacle state publisher (coordinator node subscribes to this) ----
-        self.obstacle_pub = self.create_publisher(Bool, '/obstacle_detected', 10)
+        self.obstacle_pub = self.create_publisher(Bool, OBSTACLE_TOPIC, 10)
 
         # ---- State ----
         self.current_obstacle_raw = False     # latest raw obstacle detection
@@ -82,65 +85,7 @@ class ObstacleModeSwitcher(Node):
         front_center_deg = float(self.get_parameter('front_center_deg').value)
         min_valid_m     = float(self.get_parameter('min_valid_m').value)
 
-        ranges = msg.ranges
-        if not ranges:
-            return
-
-        a_min = msg.angle_min
-        a_inc = msg.angle_increment
-
-        def angle_to_index(a_rad: float) -> int:
-            return int(round((a_rad - a_min) / a_inc))
-
-        # Pivot the sector around front_center_deg with wrap-around support.
-        # The scan spans [angle_min, angle_max]. When the desired sector crosses
-        # the ±180° boundary it wraps; we handle this by building a list of
-        # (start_idx, end_idx) segments and scanning all of them.
-        center_rad = math.radians(front_center_deg)
-        half_rad   = math.radians(front_angle_deg)
-
-        n          = len(ranges)
-        a_max      = msg.angle_max
-
-        lo_rad = center_rad - half_rad   # left  edge of sector
-        hi_rad = center_rad + half_rad   # right edge of sector
-
-        def clamp_index(idx: int) -> int:
-            return max(0, min(n - 1, idx))
-
-        # Check whether the sector overflows the scan boundaries
-        segments = []
-
-        if lo_rad < msg.angle_min:
-            # Sector wraps past the low boundary → split into two parts:
-            #   [wrapped_lo .. a_max]  and  [a_min .. hi]
-            wrap_lo = lo_rad + 2 * math.pi      # equivalent angle on the high side
-            segments.append((clamp_index(angle_to_index(wrap_lo)), n - 1))
-            segments.append((0, clamp_index(angle_to_index(hi_rad))))
-
-        elif hi_rad > a_max:
-            # Sector wraps past the high boundary → split into two parts:
-            #   [lo .. a_max]  and  [a_min .. wrapped_hi]
-            wrap_hi = hi_rad - 2 * math.pi      # equivalent angle on the low side
-            segments.append((clamp_index(angle_to_index(lo_rad)), n - 1))
-            segments.append((0, clamp_index(angle_to_index(wrap_hi))))
-
-        else:
-            # No wrap — single contiguous segment
-            segments.append((clamp_index(angle_to_index(lo_rad)),
-                             clamp_index(angle_to_index(hi_rad))))
-
-        nearest = float('inf')
-        for seg_start, seg_end in segments:
-            if seg_start > seg_end:
-                seg_start, seg_end = seg_end, seg_start
-            for i in range(seg_start, seg_end + 1):
-                r = ranges[i]
-                if r <= min_valid_m or math.isinf(r) or math.isnan(r):
-                    continue
-                if r < nearest:
-                    nearest = r
-
+        nearest = nearest_in_sector(msg, front_center_deg, front_angle_deg, min_valid_m)
         obstacle = (math.isfinite(nearest) and nearest <= threshold)
 
         # Track raw change time for debounce
