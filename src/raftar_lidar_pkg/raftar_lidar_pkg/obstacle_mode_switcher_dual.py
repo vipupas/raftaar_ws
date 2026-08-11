@@ -2,23 +2,31 @@
 """
 obstacle_mode_switcher_dual.py
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Dual front-facing LiDAR obstacle-aware MAVROS mode switcher with MANUAL
-mode lock.  Both LiDARs face forward at different heights to catch
-obstacles the other might miss (ground-level vs. upper-body).
+Watches two LiDARs and hands control to ROS when either one sees
+something in the way.
 
-Each LiDAR has its own threshold, detection sector, and topic.
+Both sensors look ahead of the rover, at different heights, so that each
+catches what the other would miss - a kerb or a tow bar low down, a
+branch or a wing mirror higher up.
 
-LiDAR layout
-------------
-  /scan_top    – front-facing, mounted ~1.15m above ground
-  /scan_low    – front-facing, mounted ~0.58m above ground
+  /scan_top   mounted ~1.15 m up, sensor body rotated 180 deg
+  /scan_low   mounted ~0.58 m up, sensor body facing forwards
+
+Because the two are bolted on at different angles, "straight ahead" is a
+different bearing in each one's data.  Both bearings are derived from the
+mount angles in rover_config.py, which is the same place the transforms
+come from - so the detector and the costmap can never disagree about
+which way a sensor faces.
 
 Logic
-------
-  obstacle = top_triggered OR low_triggered   (any-OR policy)
-  If current ArduPilot mode is MANUAL → block all automatic switching.
-  obstacle present (debounced)  → mode_when_obstacle  (default: GUIDED)
-  obstacle absent  (debounced)  → mode_when_clear     (default: AUTO)
+-----
+  obstacle = top_triggered OR low_triggered   (either one is enough)
+  obstacle present (held for debounce_sec) -> mode_when_obstacle (GUIDED)
+  obstacle absent  (held for debounce_sec) -> mode_when_clear    (AUTO)
+
+Safety: if the rover is in any mode other than AUTO or GUIDED - MANUAL,
+HOLD, RTL - this node issues no commands at all.  A human who has taken
+over stays in control.
 """
 
 import math
@@ -31,50 +39,12 @@ from std_msgs.msg import Bool
 from mavros_msgs.msg import State
 from mavros_msgs.srv import SetMode
 
-
-def nearest_in_sector(msg: LaserScan, center_deg: float, half_deg: float, min_valid_m: float) -> float:
-    ranges = msg.ranges
-    if not ranges:
-        return float("inf")
-
-    a_min = msg.angle_min
-    a_inc = msg.angle_increment
-    a_max = msg.angle_max
-    n = len(ranges)
-
-    center_rad = math.radians(center_deg)
-    half_rad   = math.radians(half_deg)
-
-    lo_rad = center_rad - half_rad
-    hi_rad = center_rad + half_rad
-
-    def angle_to_index(a_rad: float) -> int:
-        idx = int(round((a_rad - a_min) / a_inc))
-        return max(0, min(n - 1, idx))
-
-    segments = []
-    if lo_rad < a_min:
-        wrap_lo = lo_rad + 2 * math.pi
-        segments.append((angle_to_index(wrap_lo), n - 1))
-        segments.append((0, angle_to_index(hi_rad)))
-    elif hi_rad > a_max:
-        wrap_hi = hi_rad - 2 * math.pi
-        segments.append((angle_to_index(lo_rad), n - 1))
-        segments.append((0, angle_to_index(wrap_hi)))
-    else:
-        segments.append((angle_to_index(lo_rad), angle_to_index(hi_rad)))
-
-    nearest = float("inf")
-    for s0, s1 in segments:
-        if s0 > s1:
-            s0, s1 = s1, s0
-        for i in range(s0, s1 + 1):
-            r = ranges[i]
-            if r <= min_valid_m or math.isinf(r) or math.isnan(r):
-                continue
-            if r < nearest:
-                nearest = r
-    return nearest
+from raftar_lidar_pkg.scan_utils import nearest_in_sector
+from raftar_lidar_pkg.rover_config import (
+    TOP_SCAN_TOPIC, LOW_SCAN_TOPIC, OBSTACLE_TOPIC,
+    TOP_LIDAR_YAW_DEG, LOW_LIDAR_YAW_DEG, forward_bearing_deg,
+    OBSTACLE_THRESHOLD_TOP_M, OBSTACLE_THRESHOLD_LOW_M, DETECTION_HALF_ANGLE_DEG,
+)
 
 
 class DualObstacleModeSwitcher(Node):
@@ -88,17 +58,20 @@ class DualObstacleModeSwitcher(Node):
         super().__init__("obstacle_mode_switcher_dual")
 
         # ---- Per-sensor parameters ----
+        # Defaults come from rover_config so that the sector each LiDAR
+        # watches always matches the transform that tells the costmap
+        # which way that same LiDAR is pointing.
         # Top LiDAR
-        self.declare_parameter("scan_topic_top",       "/scan_top")
-        self.declare_parameter("threshold_m_top",       2.0)
-        self.declare_parameter("top_center_deg",       180.0)
-        self.declare_parameter("top_half_deg",          45.0)
+        self.declare_parameter("scan_topic_top",       TOP_SCAN_TOPIC)
+        self.declare_parameter("threshold_m_top",      OBSTACLE_THRESHOLD_TOP_M)
+        self.declare_parameter("top_center_deg",       forward_bearing_deg(TOP_LIDAR_YAW_DEG))
+        self.declare_parameter("top_half_deg",         DETECTION_HALF_ANGLE_DEG)
 
         # Low LiDAR
-        self.declare_parameter("scan_topic_low",        "/scan_low")
-        self.declare_parameter("threshold_m_low",        2.0)
-        self.declare_parameter("low_center_deg",         0.0)
-        self.declare_parameter("low_half_deg",          45.0)
+        self.declare_parameter("scan_topic_low",       LOW_SCAN_TOPIC)
+        self.declare_parameter("threshold_m_low",      OBSTACLE_THRESHOLD_LOW_M)
+        self.declare_parameter("low_center_deg",       forward_bearing_deg(LOW_LIDAR_YAW_DEG))
+        self.declare_parameter("low_half_deg",         DETECTION_HALF_ANGLE_DEG)
 
         # Shared
         self.declare_parameter("min_valid_m",          0.05)
@@ -131,7 +104,7 @@ class DualObstacleModeSwitcher(Node):
         while not self.set_mode_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn("Still waiting for /mavros/set_mode ...")
 
-        self.obstacle_pub = self.create_publisher(Bool, "/obstacle_detected", 10)
+        self.obstacle_pub = self.create_publisher(Bool, OBSTACLE_TOPIC, 10)
 
         for sid in self.SENSOR_IDS:
             self.create_subscription(

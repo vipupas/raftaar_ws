@@ -3,7 +3,7 @@
 <package format="3">
   <name>raftar_lidar_pkg</name>
   <version>0.0.0</version>
-  <description>this package is for all lidar related works</description>
+  <description>LiDAR obstacle avoidance for the Raftaar ArduPilot rover</description>
   <maintainer email="s.pvimalpratap9458@gmail.com">Vip</maintainer>
   <license>Apache-2.0</license>
 
@@ -12,6 +12,28 @@
   <depend>nav_msgs</depend>
   <depend>mavros_msgs</depend>
   <depend>geometry_msgs</depend>
+
+  <!-- Used by coordinator_node but previously undeclared, so a fresh
+       machine set up with `rosdep install` was missing them and the node
+       died on import. -->
+  <depend>std_msgs</depend>
+  <depend>geographic_msgs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <!-- Started by the launch files. -->
+  <exec_depend>rplidar_ros</exec_depend>
+  <exec_depend>mavros</exec_depend>
+  <exec_depend>nav2_controller</exec_depend>
+  <exec_depend>nav2_mppi_controller</exec_depend>
+  <exec_depend>nav2_costmap_2d</exec_depend>
+  <exec_depend>nav2_velocity_smoother</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <!-- GPS -> local ENU conversion is done in raftar_lidar_pkg/geo.py.
+       It used to rely on pymap3d, which has no rosdep key, so rosdep
+       could never install it. -->
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

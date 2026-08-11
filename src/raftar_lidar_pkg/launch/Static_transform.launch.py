@@ -1,70 +1,51 @@
+"""
+Static_transform.launch.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+Just the fixed parts of the TF tree, on their own.  Useful for checking
+sensor alignment in RViz without starting the whole stack.
+
+    ros2 launch raftar_lidar_pkg Static_transform.launch.py
+
+Do not run this alongside rover_advance*.launch.py - those publish the
+same transforms, and two publishers of one transform makes the tree
+jitter between them.
+
+The frame names and offsets used to be written out by hand here and
+disagreed with the ones in rover_advance*.launch.py (different child frame
+names, different x offsets).  Both now read rover_config.py.
+"""
+
+import math
+
 from launch import LaunchDescription
 from launch_ros.actions import Node
+
+from raftar_lidar_pkg import rover_config as cfg
+
+
+def _static_tf(name, xyz, yaw_deg, parent, child):
+    x, y, z = xyz
+    return Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name=name,
+        output='screen',
+        arguments=[
+            '--x', str(x), '--y', str(y), '--z', str(z),
+            '--roll', '0.0', '--pitch', '0.0',
+            '--yaw', str(math.radians(yaw_deg)),
+            '--frame-id', parent,
+            '--child-frame-id', child,
+        ],
+    )
 
 
 def generate_launch_description():
     return LaunchDescription([
-
-        # Static transform: base_link -> laser_frame
-        # x=1.0m forward, z=0.5m height, no rotation
-         # ----------------------------------------------------------------
-                # 1a. Static Transform: base_link -> laser_top (1.15m above ground)
-                # ----------------------------------------------------------------
-                Node(
-                    package='tf2_ros',
-                    executable='static_transform_publisher',
-                    name='base_link_to_laser_top',
-                    arguments=[
-                        '--x', '0.73',        # centered front/rear on rover
-                        '--y', '0.0',        # centered left/right
-                        '--z', '1.15',       # top LiDAR height from ground
-                        '--roll', '0.0',
-                        '--pitch', '0.0',
-                        '--yaw', '0.0',
-                        '--frame-id', 'base_link',
-                        '--child-frame-id', 'laser_top'
-                    ],
-                    output='screen'
-                ),
-        
-                # ----------------------------------------------------------------
-                # 1b. Static Transform: base_link -> laser_low (0.58m above ground)
-                # ----------------------------------------------------------------
-                Node(
-                    package='tf2_ros',
-                    executable='static_transform_publisher',
-                    name='base_link_to_laser_low',
-                    arguments=[
-                        '--x', '1.08',        # centered front/rear on rover
-                        '--y', '0.0',        # centered left/right
-                        '--z', '0.58',       # low LiDAR height from ground
-                        '--roll', '0.0',
-                        '--pitch', '0.0',
-                        '--yaw', '0.0',
-                        '--frame-id', 'base_link',
-                        '--child-frame-id', 'laser_low'
-                    ],
-                    output='screen'
-                ),
-        
-                # ----------------------------------------------------------------
-                # 1c. Static Transform: map -> odom (identity, both ENU at home)
-                # ----------------------------------------------------------------
-                Node(
-                    package='tf2_ros',
-                    executable='static_transform_publisher',
-                    name='map_to_odom',
-                    arguments=[
-                        '--x', '0.0',
-                        '--y', '0.0',
-                        '--z', '0.0',
-                        '--roll', '0.0',
-                        '--pitch', '0.0',
-                        '--yaw', '0.0',
-                        '--frame-id', 'map',
-                        '--child-frame-id', 'odom'
-                    ],
-                    output='screen'
-                ),
-
+        _static_tf('map_to_odom', (0.0, 0.0, 0.0), 0.0,
+                   cfg.MAP_FRAME, cfg.ODOM_FRAME),
+        _static_tf('base_link_to_laser_top', cfg.TOP_LIDAR_XYZ, cfg.TOP_LIDAR_YAW_DEG,
+                   cfg.BASE_FRAME, cfg.TOP_LIDAR_FRAME),
+        _static_tf('base_link_to_laser_low', cfg.LOW_LIDAR_XYZ, cfg.LOW_LIDAR_YAW_DEG,
+                   cfg.BASE_FRAME, cfg.LOW_LIDAR_FRAME),
     ])

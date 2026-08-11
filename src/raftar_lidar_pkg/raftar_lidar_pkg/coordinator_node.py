@@ -1,244 +1,256 @@
 #!/usr/bin/env python3
+"""
+coordinator_node.py
+~~~~~~~~~~~~~~~~~~~
+Decides *where to drive* while the rover is dodging an obstacle.
+
+It does local planning only - no map server, no AMCL, no global planner,
+no bt_navigator.  When an obstacle appears it hands Nav2's controller a
+straight line from "where I am" to "the mission waypoint I was heading
+for", and the local planner bends that line around whatever the LiDARs
+can see.
+
+Division of responsibility
+--------------------------
+  obstacle_mode_switcher_dual  owns the flight mode (AUTO <-> GUIDED).
+  coordinator_node (this file) owns the Nav2 goal.
+They talk over /obstacle_detected.  This node never changes mode itself -
+two nodes fighting over one setting is a bug waiting to happen.
+"""
+
 import math
 import time
+
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+
 from nav2_msgs.action import FollowPath
 from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
 from nav_msgs.msg import Odometry, Path
-from mavros_msgs.msg import WaypointList, WaypointReached, HomePosition, State
-from mavros_msgs.srv import SetMode, WaypointPull
+from mavros_msgs.msg import WaypointList, WaypointReached, HomePosition
+from mavros_msgs.srv import WaypointPull
 from std_msgs.msg import Bool
 from geographic_msgs.msg import GeoPointStamped
 import tf2_ros
 
-import pymap3d
+from raftar_lidar_pkg.geo import geodetic_to_enu
+from raftar_lidar_pkg.rover_config import (
+    MAP_FRAME, ODOM_FRAME, BASE_FRAME, CMD_VEL_TOPIC, OBSTACLE_TOPIC,
+)
+
+# MAVLink mission commands that carry a latitude/longitude we can drive to.
+# Anything else (RTL, DO_*, conditionals) has no usable position.
+MAV_CMD_NAV_WAYPOINT = 16
+MAV_CMD_NAV_SPLINE_WAYPOINT = 82
+NAVIGABLE_COMMANDS = {MAV_CMD_NAV_WAYPOINT, MAV_CMD_NAV_SPLINE_WAYPOINT}
 
 
 class CoordinatorNode(Node):
-    """
-    Coordinator node (LOCAL PLANNING ONLY - no map, no AMCL, no bt_navigator):
-    - Monitors obstacle detection from obstacle_mode_switcher
-    - Reads current waypoint from ArduPilot mission
-    - When obstacle detected  -> switch to GUIDED -> send a FollowPath goal
-      (straight line from current pose to the current mission waypoint)
-      to controller_server's local DWB planner
-    - When obstacle cleared   -> cancel FollowPath goal -> switch back to AUTO
-    - Watchdog: if the local planner cannot make progress within a timeout
-      while an obstacle is still present, cancel the goal and force a
-      zero-velocity stop instead of letting it oscillate/creep indefinitely.
-    """
 
     def __init__(self):
         super().__init__('coordinator_node')
 
         # ---- Parameters ----
-        self.declare_parameter('cooldown_sec', 2.0)
-        self.declare_parameter('mode_guided', 'GUIDED')
-        self.declare_parameter('mode_auto', 'AUTO')
-        self.declare_parameter('stuck_timeout_sec', 8.0)   # watchdog: max time to let Nav2 try before forcing a stop
+        self.declare_parameter('stuck_timeout_sec', 8.0)
         self.declare_parameter('progress_check_interval_sec', 1.0)
-        self.declare_parameter('min_progress_m', 0.1)       # must close at least this much distance to count as "progress"
-        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('min_progress_m', 0.1)
+        self.declare_parameter('cmd_vel_topic', CMD_VEL_TOPIC)
+        self.declare_parameter('controller_id', 'FollowPath')
+        self.declare_parameter('goal_checker_id', 'goal_checker')
+        # Set False if MAVROS is configured to publish odom->base_link itself.
+        # Two publishers of the same transform corrupts the TF tree.
+        self.declare_parameter('publish_odom_tf', True)
 
         # ---- State ----
-        self.obstacle_detected   = False       # latest obstacle state from obstacle node
-        self.current_wp_index    = 0           # current waypoint index rover is heading to
-        self.waypoints           = []          # full mission waypoint list
+        self.obstacle_detected = False
+        self.waypoints = []
+        self.mission_current_seq = None    # from WaypointList.current_seq
+        self.last_reached_seq = None       # from WaypointReached
         self.home_lat = None
         self.home_lon = None
         self.home_alt = None
-        self.rover_pose          = None        # current rover pose in odom frame
-        self.nav2_goal_active    = False       # whether Nav2 goal is currently active
-        self.nav2_goal_handle    = None        # handle to cancel Nav2 goal
-        self.last_mode_cmd_time  = 0.0
-        self.current_mode        = ''          # current flight mode from MAVROS
+        self.home_is_ekf_origin = False    # True once gp_origin has been seen
+        self.rover_pose = None
+        self.nav2_goal_active = False
+        self.nav2_goal_handle = None
 
         # Watchdog state
-        self.goal_target_east    = None
-        self.goal_target_north   = None
-        self.goal_start_time     = None
-        self.best_distance_seen  = None
-        self.last_progress_time  = None
-        self.stopped_due_to_stuck = False       # latched: don't retry until obstacle fully clears
+        self.goal_target_east = None
+        self.goal_target_north = None
+        self.best_distance_seen = None
+        self.last_progress_time = None
+        self.stopped_due_to_stuck = False   # latched until the obstacle clears
 
-        # ---- TF broadcaster: map -> base_link (MUST start early so Nav2 costmap doesn't stall) ----
+        # ---- TF: odom -> base_link, published early so the Nav2 costmap
+        #      has a transform to work with before odometry arrives ----
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         self.tf_timer = self.create_timer(0.05, self._broadcast_tf)
 
-        # ---- MAVROS set_mode service ----
-        self.set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
-        self.get_logger().info("Waiting for /mavros/set_mode ...")
-        while not self.set_mode_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn("Still waiting for /mavros/set_mode ...")
-
-        # ---- Nav2 action client (FollowPath, served directly by controller_server -
-        #      no bt_navigator / no global planner / no map required) ----
+        # ---- Nav2 action client ----
+        # controller_server serves /follow_path directly; no behaviour tree.
         self.nav2_client = ActionClient(self, FollowPath, '/follow_path')
-        self.get_logger().info("Waiting for Nav2 controller_server /follow_path action server ...")
+        self.get_logger().info('Waiting for Nav2 /follow_path action server ...')
         while not self.nav2_client.wait_for_server(timeout_sec=1.0):
-            self.get_logger().warn("Still waiting for /follow_path ...")
+            self.get_logger().warn('Still waiting for /follow_path ...')
 
-        # ---- Direct cmd_vel publisher for emergency/watchdog stop ----
-        cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
-        self.stop_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
+        # ---- Emergency stop publisher ----
+        self.stop_pub = self.create_publisher(
+            Twist, self.get_parameter('cmd_vel_topic').value, 10)
+        self.stop_hold_timer = self.create_timer(0.1, self._hold_stop)
 
-        # ---- MAVROS pull mission service ----
+        # ---- Mission pull ----
         self.pull_mission_client = self.create_client(WaypointPull, '/mavros/mission/pull')
         self.pull_timer = self.create_timer(3.0, self._try_pull_mission)
 
         # ---- Subscribers ----
+        self.create_subscription(Bool, OBSTACLE_TOPIC, self.cb_obstacle, 10)
+        self.create_subscription(
+            WaypointReached, '/mavros/mission/reached', self.cb_waypoint_reached, 10)
+        self.create_subscription(
+            WaypointList, '/mavros/mission/waypoints', self.cb_waypoints, 10)
 
-        # Obstacle state from obstacle_mode_switcher node
-        self.create_subscription(Bool, '/obstacle_detected', self.cb_obstacle, 10)
-
-        # Current waypoint index being targeted by ArduPilot
-        self.create_subscription(WaypointReached, '/mavros/mission/reached', self.cb_waypoint_reached, 10)
-
-        # Full mission waypoint list
-        self.create_subscription(WaypointList, '/mavros/mission/waypoints', self.cb_waypoints, 10)
-
-        # Home position for GPS -> ENU conversion
+        # gp_origin is latched, so it needs TRANSIENT_LOCAL to be received at all.
         gp_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(HomePosition, '/mavros/home_position/home', self.cb_home_position, 10)
-        self.create_subscription(GeoPointStamped, '/mavros/global_position/gp_origin', self.cb_gp_origin, gp_qos)
+        self.create_subscription(
+            GeoPointStamped, '/mavros/global_position/gp_origin', self.cb_gp_origin, gp_qos)
+        self.create_subscription(
+            HomePosition, '/mavros/home_position/home', self.cb_home_position, 10)
 
-        # Rover odometry for current position
+        # MAVROS publishes sensor data BEST_EFFORT; a RELIABLE subscriber
+        # would never connect to it.
         odom_qos = QoSProfile(depth=10)
         odom_qos.reliability = ReliabilityPolicy.BEST_EFFORT
-        self.create_subscription(Odometry, '/mavros/local_position/odom', self.cb_odom, odom_qos)
+        self.create_subscription(
+            Odometry, '/mavros/local_position/odom', self.cb_odom, odom_qos)
 
-        # Current mode from MAVROS
-        self.create_subscription(State, '/mavros/state', self.cb_state, 10)
+        # ---- Watchdog ----
+        self.create_timer(
+            float(self.get_parameter('progress_check_interval_sec').value),
+            self.watchdog_check)
 
-        # ---- Watchdog timer ----
-        interval = float(self.get_parameter('progress_check_interval_sec').value)
-        self.watchdog_timer = self.create_timer(interval, self.watchdog_check)
+        self.get_logger().info('Coordinator node started (local planning / FollowPath).')
 
-        self.get_logger().info("Coordinator node started (local planning / FollowPath mode).")
+    # ------------------------------------------------------------------ #
+    # Mission
+    # ------------------------------------------------------------------ #
 
     def _try_pull_mission(self):
-        """Repeatedly pull mission from MAVROS until waypoints arrive."""
+        """Ask the flight controller for its mission, until it answers."""
         if self.waypoints:
             self.pull_timer.cancel()
             return
-
         if not self.pull_mission_client.wait_for_service(timeout_sec=0.5):
             return
 
-        req = WaypointPull.Request()
-        future = self.pull_mission_client.call_async(req)
+        future = self.pull_mission_client.call_async(WaypointPull.Request())
 
         def done_cb(fut):
             try:
                 res = fut.result()
                 if res and res.success:
-                    self.get_logger().info(f"Mission pull successful, {res.wp_received} waypoints received.")
+                    self.get_logger().info(f'Mission pull OK, {res.wp_received} waypoints.')
                 else:
-                    self.get_logger().warn("Mission pull returned no success.")
-            except Exception as e:
-                self.get_logger().error(f"Mission pull error: {e}")
+                    self.get_logger().warn('Mission pull returned no success.')
+            except Exception as exc:
+                self.get_logger().error(f'Mission pull error: {exc}')
 
         future.add_done_callback(done_cb)
 
-    # ---------------------------------------------------------------
-    # Callbacks
-    # ---------------------------------------------------------------
-
-    def cb_obstacle(self, msg: Bool):
-        """Receive obstacle detection state from obstacle_mode_switcher.
-        The obstacle node handles mode switching (GUIDED/AUTO).
-        This coordinator only manages Nav2 FollowPath goals."""
-        previous = self.obstacle_detected
-        self.obstacle_detected = msg.data
-
-        if self.obstacle_detected and not previous:
-            if self.nav2_goal_active:
-                return
-            self.get_logger().info("Obstacle detected! Sending FollowPath goal.")
-            self.stopped_due_to_stuck = False
-            self.send_nav2_goal()
-
-        elif not self.obstacle_detected and previous:
-            if not self.nav2_goal_active and not self.nav2_goal_handle:
-                self.get_logger().info("Obstacle cleared. No active Nav2 goal to cancel.")
-                return
-            self.get_logger().info("Obstacle cleared! Cancelling Nav2 goal.")
-            self.cancel_nav2_goal()
-            self.stopped_due_to_stuck = False
+    def cb_waypoints(self, msg: WaypointList):
+        self.waypoints = list(msg.waypoints)
+        self.mission_current_seq = msg.current_seq
+        self.get_logger().info(
+            f'Mission loaded: {len(self.waypoints)} waypoints, '
+            f'currently targeting #{msg.current_seq}.')
 
     def cb_waypoint_reached(self, msg: WaypointReached):
-        """Track which waypoint was last reached -> next one is current target."""
-        self.current_wp_index = msg.wp_seq + 1
-        self.get_logger().info(f"Waypoint {msg.wp_seq} reached. Now heading to waypoint {self.current_wp_index}.")
+        self.last_reached_seq = msg.wp_seq
+        self.get_logger().info(f'Waypoint {msg.wp_seq} reached.')
 
-    def cb_waypoints(self, msg: WaypointList):
-        """Store the full mission waypoint list."""
-        self.waypoints = msg.waypoints
-        self.get_logger().info(f"Mission loaded: {len(self.waypoints)} waypoints.")
+    def _target_waypoint(self):
+        """The mission item the rover is currently driving toward.
+
+        Returns (index, waypoint) or (None, None).
+
+        Three sources, best first.  ``is_current`` is the flag ArduPilot
+        itself sets, so it is authoritative; ``current_seq`` comes with the
+        list; "last reached + 1" is the fallback.  The old code used only
+        the fallback, which starts at 0 - and mission item 0 is *home*, so
+        an obstacle met before the first waypoint sent the rover home.
+        """
+        if not self.waypoints:
+            return None, None
+
+        idx = None
+        for i, wp in enumerate(self.waypoints):
+            if wp.is_current:
+                idx = i
+                break
+        if idx is None and self.mission_current_seq is not None:
+            idx = self.mission_current_seq
+        if idx is None and self.last_reached_seq is not None:
+            idx = self.last_reached_seq + 1
+        if idx is None:
+            return None, None
+
+        # Skip item 0 (home) and anything without a real position.
+        for i in range(max(idx, 1), len(self.waypoints)):
+            wp = self.waypoints[i]
+            if wp.command not in NAVIGABLE_COMMANDS:
+                continue
+            if wp.x_lat == 0.0 and wp.y_long == 0.0:
+                continue
+            return i, wp
+
+        return None, None
+
+    # ------------------------------------------------------------------ #
+    # Position
+    # ------------------------------------------------------------------ #
+
+    def cb_gp_origin(self, msg: GeoPointStamped):
+        """The EKF origin - the exact point /mavros/local_position/odom is
+        measured from.  This is the correct reference and it overrides any
+        home position we may have latched earlier."""
+        lat, lon, alt = msg.position.latitude, msg.position.longitude, msg.position.altitude
+        if not self.home_is_ekf_origin:
+            self.home_lat, self.home_lon, self.home_alt = lat, lon, alt
+            self.home_is_ekf_origin = True
+            self.get_logger().info(
+                f'Local origin from gp_origin: {lat:.7f}, {lon:.7f}, {alt:.2f}')
 
     def cb_home_position(self, msg: HomePosition):
-        """Store home GPS position for GPS -> ENU conversion."""
+        """Fallback origin.  Home is usually the EKF origin but is not
+        guaranteed to be, so gp_origin wins whenever it shows up."""
         if self.home_lat is None:
             self.home_lat = msg.geo.latitude
             self.home_lon = msg.geo.longitude
             self.home_alt = msg.geo.altitude
-            self.get_logger().info(f"Home: lat={self.home_lat:.6f}, lon={self.home_lon:.6f}, alt={self.home_alt:.2f}")
-
-    def cb_gp_origin(self, msg):
-        """Fallback: home GPS from latched gp_origin."""
-        if self.home_lat is None:
-            self.home_lat = msg.position.latitude
-            self.home_lon = msg.position.longitude
-            self.home_alt = msg.position.altitude
-            self.get_logger().info(f"Home (gp_origin): lat={self.home_lat:.6f}, lon={self.home_lon:.6f}, alt={self.home_alt:.2f}")
+            self.get_logger().warn(
+                f'Local origin from home_position (gp_origin not seen yet): '
+                f'{self.home_lat:.7f}, {self.home_lon:.7f}')
 
     def cb_odom(self, msg: Odometry):
-        """Store current rover pose (TF broadcasting handled by timer)."""
         self.rover_pose = msg.pose.pose
 
-    def cb_state(self, msg: State):
-        """Track current ArduPilot mode."""
-        self.current_mode = msg.mode
-
-    # ---------------------------------------------------------------
-    # Mode switching
-    # ---------------------------------------------------------------
-
-    def switch_mode(self, mode: str):
-        """Send set_mode request to MAVROS."""
-        req = SetMode.Request()
-        req.base_mode = 0
-        req.custom_mode = mode
-
-        future = self.set_mode_client.call_async(req)
-
-        def done_cb(fut):
-            try:
-                res = fut.result()
-                if res and res.mode_sent:
-                    self.get_logger().info(f"Mode switched to: {mode}")
-                else:
-                    self.get_logger().warn(f"Mode switch failed: {mode}")
-            except Exception as e:
-                self.get_logger().error(f"set_mode error: {e}")
-
-        future.add_done_callback(done_cb)
-
-    # ---------------------------------------------------------------
-    # TF broadcasting
-    # ---------------------------------------------------------------
-
     def _broadcast_tf(self):
-        """Publish map -> base_link transform at 20Hz. Falls back to identity
-        before odometry arrives so Nav2 costmap doesn't stall on startup."""
+        """Publish odom -> base_link at 20 Hz.
+
+        The rest of the tree is static: map -> odom comes from the launch
+        file.  The old code published map -> base_link *and* a static
+        map -> odom, which left odom dangling and would have broken the
+        tree outright if MAVROS were ever configured to publish its own
+        odom -> base_link.
+        """
+        if not self.get_parameter('publish_odom_tf').value:
+            return
+
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'map'
-        t.child_frame_id = 'base_link'
+        t.header.frame_id = ODOM_FRAME
+        t.child_frame_id = BASE_FRAME
 
         if self.rover_pose is not None:
             t.transform.translation.x = self.rover_pose.position.x
@@ -246,57 +258,62 @@ class CoordinatorNode(Node):
             t.transform.translation.z = self.rover_pose.position.z
             t.transform.rotation = self.rover_pose.orientation
         else:
-            t.transform.rotation.w = 1.0  # identity quaternion
+            t.transform.rotation.w = 1.0     # identity until odometry arrives
 
         self.tf_broadcaster.sendTransform(t)
 
-    # ---------------------------------------------------------------
-    # GPS -> ENU conversion
-    # ---------------------------------------------------------------
-
-    def gps_to_enu(self, lat: float, lon: float, alt: float):
+    def gps_to_enu(self, lat, lon, alt):
         if self.home_lat is None:
-            self.get_logger().error("Home position not received yet! Cannot convert GPS to ENU.")
+            self.get_logger().error('No local origin yet; cannot convert GPS.')
             return None, None, None
-        east, north, up = pymap3d.geodetic2enu(lat, lon, alt, self.home_lat, self.home_lon, self.home_alt)
-        return east, north, up
+        return geodetic_to_enu(lat, lon, alt, self.home_lat, self.home_lon, self.home_alt)
 
-    # ---------------------------------------------------------------
-    # Nav2 goal (FollowPath - local planner only, no map/global planner)
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Obstacle reaction
+    # ------------------------------------------------------------------ #
+
+    def cb_obstacle(self, msg: Bool):
+        previous = self.obstacle_detected
+        self.obstacle_detected = msg.data
+
+        if self.obstacle_detected and not previous:
+            if self.nav2_goal_active:
+                return
+            self.get_logger().info('Obstacle detected. Sending FollowPath goal.')
+            self.stopped_due_to_stuck = False
+            self.send_nav2_goal()
+
+        elif not self.obstacle_detected and previous:
+            self.get_logger().info('Obstacle cleared.')
+            self.cancel_nav2_goal()
+            self.stopped_due_to_stuck = False
 
     def send_nav2_goal(self):
-        """Build a simple straight-line path (current pose -> target waypoint)
-        and send it to controller_server's FollowPath action. DWB will locally
-        deviate from this line to avoid obstacles seen in the local costmap."""
+        """Send a straight line from here to the target waypoint.
 
-        if not self.waypoints:
-            self.get_logger().warn("No waypoints loaded from mission. Cannot send Nav2 goal.")
-            return
-
-        if self.current_wp_index >= len(self.waypoints):
-            self.get_logger().warn("Current waypoint index out of range.")
-            return
-
+        The line is only a suggestion.  The local planner scores its own
+        candidate trajectories against the costmap and deviates from this
+        line as much as it needs to, which is what produces the avoidance
+        manoeuvre.
+        """
         if self.rover_pose is None:
-            self.get_logger().warn("No odometry yet. Cannot send Nav2 goal.")
+            self.get_logger().warn('No odometry yet; cannot send Nav2 goal.')
             return
 
-        wp = self.waypoints[self.current_wp_index]
+        index, wp = self._target_waypoint()
+        if wp is None:
+            self.get_logger().warn('No drivable mission waypoint; cannot send Nav2 goal.')
+            return
 
-        # Convert GPS waypoint to local ENU
-        east, north, up = self.gps_to_enu(wp.x_lat, wp.y_long, wp.z_alt)
+        east, north, _ = self.gps_to_enu(wp.x_lat, wp.y_long, wp.z_alt)
         if east is None:
             return
 
         self.get_logger().info(
-            f"Sending FollowPath goal: waypoint {self.current_wp_index} "
-            f"-> ENU: x={east:.2f}, y={north:.2f}"
-        )
+            f'FollowPath goal: waypoint #{index} -> ENU x={east:.2f}, y={north:.2f}')
 
-        # Build a 2-point straight-line Path: current pose -> target waypoint
         path = Path()
-        path.header.frame_id = 'map'
+        path.header.frame_id = MAP_FRAME
         path.header.stamp = self.get_clock().now().to_msg()
 
         start = PoseStamped()
@@ -310,77 +327,81 @@ class CoordinatorNode(Node):
         target.pose.position.y = north
         target.pose.position.z = 0.0
 
-        dx = east - self.rover_pose.position.x
-        dy = north - self.rover_pose.position.y
-        yaw = math.atan2(dy, dx)
+        yaw = math.atan2(north - self.rover_pose.position.y,
+                         east - self.rover_pose.position.x)
         target.pose.orientation.z = math.sin(yaw / 2.0)
         target.pose.orientation.w = math.cos(yaw / 2.0)
         path.poses.append(target)
 
         goal = FollowPath.Goal()
         goal.path = path
-        goal.controller_id = 'FollowPath'
+        goal.controller_id = str(self.get_parameter('controller_id').value)
+        goal.goal_checker_id = str(self.get_parameter('goal_checker_id').value)
 
-        # ---- Watchdog init for this goal ----
+        # Arm the watchdog for this attempt.
         self.goal_target_east = east
         self.goal_target_north = north
-        self.goal_start_time = time.time()
         self.best_distance_seen = self._distance_to_target()
         self.last_progress_time = time.time()
 
-        send_goal_future = self.nav2_client.send_goal_async(goal)
-        send_goal_future.add_done_callback(self.nav2_goal_response_cb)
+        self.nav2_client.send_goal_async(goal).add_done_callback(self.nav2_goal_response_cb)
 
     def nav2_goal_response_cb(self, future):
-        """Called when Nav2 accepts or rejects the goal."""
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().warn("Nav2 rejected the goal!")
-            self.nav2_goal_active = True   # latch — don't retry, obstacle is still present
-            self.nav2_goal_handle = None
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.get_logger().error(f'Nav2 goal send failed: {exc}')
+            self._clear_goal_state()
             return
 
-        self.get_logger().info("Nav2 accepted the goal. Avoiding obstacle...")
+        if not goal_handle.accepted:
+            # Do NOT latch nav2_goal_active here.  The old code set it True
+            # with a null handle, so cancelling later fell through without
+            # resetting it - and every subsequent obstacle was ignored for
+            # the rest of the run, silently.
+            self.get_logger().warn('Nav2 rejected the goal.')
+            self._clear_goal_state()
+            return
+
+        self.get_logger().info('Nav2 accepted the goal. Avoiding obstacle ...')
         self.nav2_goal_active = True
         self.nav2_goal_handle = goal_handle
-
-        # Monitor result
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self.nav2_result_cb)
+        goal_handle.get_result_async().add_done_callback(self.nav2_result_cb)
 
     def nav2_result_cb(self, future):
-        """Called when Nav2 finishes the goal."""
+        try:
+            status = future.result().status
+            self.get_logger().info(f'Nav2 goal finished (status {status}).')
+        except Exception as exc:
+            self.get_logger().warn(f'Nav2 result error: {exc}')
+        self._clear_goal_state()
+
+    def _clear_goal_state(self):
         self.nav2_goal_active = False
         self.nav2_goal_handle = None
-        self.get_logger().info("Nav2 goal completed.")
 
     def cancel_nav2_goal(self):
-        """Cancel active Nav2 goal."""
-        if self.nav2_goal_handle is not None and self.nav2_goal_active:
-            self.get_logger().info("Cancelling Nav2 goal...")
+        if self.nav2_goal_handle is not None:
+            self.get_logger().info('Cancelling Nav2 goal ...')
             self.nav2_goal_handle.cancel_goal_async()
-            self.nav2_goal_active = False
-            self.nav2_goal_handle = None
-        else:
-            self.get_logger().info("No active Nav2 goal to cancel.")
+        self._clear_goal_state()
 
-    # ---------------------------------------------------------------
-    # Watchdog: detect "stuck" (no progress) and force a safe stop
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Watchdog
+    # ------------------------------------------------------------------ #
 
     def _distance_to_target(self):
         if self.rover_pose is None or self.goal_target_east is None:
             return None
-        dx = self.goal_target_east - self.rover_pose.position.x
-        dy = self.goal_target_north - self.rover_pose.position.y
-        return math.hypot(dx, dy)
+        return math.hypot(self.goal_target_east - self.rover_pose.position.x,
+                          self.goal_target_north - self.rover_pose.position.y)
 
     def watchdog_check(self):
-        """Runs periodically. If the local planner is active but not making
-        real progress toward the target for longer than stuck_timeout_sec,
-        cancel the goal and force a zero-velocity stop. Requires the obstacle
-        to fully clear (handled in cb_obstacle) before trying again."""
+        """Stop the rover if the local planner cannot make headway.
 
+        Without this, a rover facing an obstacle too wide to go around will
+        creep and oscillate against it indefinitely.
+        """
         if not self.nav2_goal_active or self.stopped_due_to_stuck:
             return
         if not self.obstacle_detected:
@@ -395,36 +416,38 @@ class CoordinatorNode(Node):
         now = time.time()
 
         if self.best_distance_seen is None or (self.best_distance_seen - dist) >= min_progress:
-            # Real progress made -> reset the clock
             self.best_distance_seen = dist
             self.last_progress_time = now
             return
 
-        stuck_duration = now - self.last_progress_time
-        if stuck_duration >= timeout:
+        stuck_for = now - self.last_progress_time
+        if stuck_for >= timeout:
             self.get_logger().error(
-                f"No progress for {stuck_duration:.1f}s while obstacle present. "
-                f"Forcing safe stop (obstacle likely too large to avoid locally)."
-            )
+                f'No progress for {stuck_for:.1f}s with an obstacle present. '
+                f'Forcing a safe stop.')
             self.force_stop()
 
     def force_stop(self):
-        """Cancel Nav2 goal and publish zero velocity directly. Stays latched
-        (stopped_due_to_stuck=True) until the obstacle fully clears, so the
-        rover does not repeatedly retry into a blocking obstacle. Remains in
-        GUIDED mode (does NOT resume AUTO) since resuming the mission could
-        drive it straight back into the same obstacle."""
+        """Cancel the goal and hold the rover still.
+
+        Stays in GUIDED on purpose.  Handing control back to AUTO would let
+        the flight controller drive straight back into the obstacle it just
+        failed to get around.
+        """
         self.cancel_nav2_goal()
         self.stopped_due_to_stuck = True
-
-        stop_msg = Twist()  # all zeros
-        for _ in range(5):
-            self.stop_pub.publish(stop_msg)
-
         self.get_logger().error(
-            "STOPPED: obstacle could not be avoided by local planner. "
-            "Remaining in GUIDED and holding position. Manual intervention needed."
-        )
+            'STOPPED: obstacle could not be avoided locally. '
+            'Holding position in GUIDED - manual intervention needed.')
+
+    def _hold_stop(self):
+        """Keep asserting zero velocity while latched stopped.
+
+        A single burst of stop messages can be missed; a steady stream at
+        10 Hz cannot.
+        """
+        if self.stopped_due_to_stuck:
+            self.stop_pub.publish(Twist())
 
 
 def main():

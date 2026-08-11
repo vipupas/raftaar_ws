@@ -34,43 +34,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from mavros_msgs.srv import SetMode
 
-
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
-def nearest_in_sector(
-    msg: LaserScan,
-    center_angle_rad: float,
-    half_width_rad: float,
-    min_valid_m: float,
-) -> float:
-    """Return the nearest valid range reading inside the requested sector."""
-    ranges = msg.ranges
-    if not ranges:
-        return float("inf")
-
-    a_min = msg.angle_min
-    a_inc = msg.angle_increment
-    n = len(ranges)
-
-    def angle_to_index(a: float) -> int:
-        return int(round((a - a_min) / a_inc))
-
-    i0 = max(0, min(n - 1, angle_to_index(center_angle_rad - half_width_rad)))
-    i1 = max(0, min(n - 1, angle_to_index(center_angle_rad + half_width_rad)))
-    if i0 > i1:
-        i0, i1 = i1, i0
-
-    nearest = float("inf")
-    for i in range(i0, i1 + 1):
-        r = ranges[i]
-        if r <= min_valid_m or math.isinf(r) or math.isnan(r):
-            continue
-        if r < nearest:
-            nearest = r
-
-    return nearest
+from raftar_lidar_pkg.scan_utils import nearest_in_sector
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +148,8 @@ class ObstacleModeSwitcher(Node):
 
         nearest = nearest_in_sector(
             msg,
-            center_angle_rad=math.radians(center_deg),
-            half_width_rad=math.radians(half_deg),
+            center_deg=center_deg,
+            half_deg=half_deg,
             min_valid_m=min_valid_m,
         )
 

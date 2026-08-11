@@ -7,6 +7,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from mavros_msgs.srv import SetMode
 
+from raftar_lidar_pkg.scan_utils import nearest_in_sector
+
 
 class ObstacleModeSwitcher(Node):
     """
@@ -70,35 +72,8 @@ class ObstacleModeSwitcher(Node):
         front_angle_deg = float(self.get_parameter('front_angle_deg').value)
         min_valid_m = float(self.get_parameter('min_valid_m').value)
 
-        ranges = msg.ranges
-        if not ranges:
-            return
-
-        # Determine indices for front sector around angle 0
-        a_min = msg.angle_min
-        a_inc = msg.angle_increment
-
-        def angle_to_index(a_rad: float) -> int:
-            return int(round((a_rad - a_min) / a_inc))
-
-        half = math.radians(front_angle_deg)
-        i0 = angle_to_index(-half)
-        i1 = angle_to_index(+half)
-
-        # Clamp and order
-        i0 = max(0, min(len(ranges) - 1, i0))
-        i1 = max(0, min(len(ranges) - 1, i1))
-        if i0 > i1:
-            i0, i1 = i1, i0
-
-        nearest = float('inf')
-        for i in range(i0, i1 + 1):
-            r = ranges[i]
-            if r <= min_valid_m or math.isinf(r) or math.isnan(r):
-                continue
-            if r < nearest:
-                nearest = r
-
+        # Front sector centred on 0 deg in the sensor's own frame.
+        nearest = nearest_in_sector(msg, 0.0, front_angle_deg, min_valid_m)
         obstacle = (math.isfinite(nearest) and nearest <= threshold)
 
         # Track raw change time for debounce
