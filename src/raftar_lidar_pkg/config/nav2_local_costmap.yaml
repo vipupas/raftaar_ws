@@ -1,0 +1,140 @@
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      # Costmap update frequency
+      update_frequency: 5.0
+      publish_frequency: 2.0
+
+      # Frame setup
+      global_frame: map            # matches MAVROS odometry frame_id and coordinator TF
+      robot_base_frame: base_link  # rover center reference
+
+      # Costmap size around the rover (20x20 meters window for large vehicle)
+      width: 20
+      height: 20
+      resolution: 0.05            # 5cm per cell
+
+      # Rolling window follows the rover
+      rolling_window: true
+
+      # Rover footprint: 2.19m long x 2.10m wide
+      # Half-length=1.095m, half-width=1.05m
+      # Polygon: front-right, front-left, rear-left, rear-right (counter-clockwise)
+      footprint: "[[1.095, 1.05], [1.095, -1.05], [-1.095, -1.05], [-1.095, 1.05]]"
+
+      # Obstacle inflation - rover stays at least this far from obstacles
+      # For large vehicle: half_diagonal(~1.52m) + safety_margin(0.5m) = ~2.0m
+      inflation_radius: 2.0
+
+      plugins: ["obstacle_layer", "inflation_layer"]
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: laser_scan_top laser_scan_low
+
+        laser_scan_top:
+          topic: /scan_top
+          max_obstacle_height: 1.5      # top LiDAR at 1.15m + 0.35m margin
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 10.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 10.0
+          obstacle_min_range: 0.0
+
+        laser_scan_low:
+          topic: /scan_low
+          max_obstacle_height: 1.0     # low LiDAR at 0.58m + 0.42m margin
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 10.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 10.0
+          obstacle_min_range: 0.0
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        inflation_radius: 2.0          # must match above
+        cost_scaling_factor: 3.0       # how quickly cost drops with distance from obstacle
+
+
+# MPPI Local Planner - smooth trajectory generation for skid-steer rover
+# Replaces DWB for better dynamic obstacle avoidance on Jetson
+controller_server:
+  ros__parameters:
+    controller_frequency: 20.0       # MPPI needs higher frequency for trajectory sampling
+
+    controller_plugins: ["FollowPath"]
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["goal_checker"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.3
+      movement_time_allowance: 10.0
+
+    goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 1.0
+      yaw_goal_tolerance: 0.5
+      stateful: true
+
+    FollowPath:
+      plugin: "mppi_controller::MPPIController"
+
+      # Velocity bounds (skid-steer: vx=forward, wz=angular, vy=0)
+      vx_max: 0.5          # max forward speed (m/s)
+      vx_min: -0.2         # slight reverse for obstacle recovery
+      vy_max: 0.0          # skid-steer: no lateral movement
+      wz_max: 0.5          # max angular speed (rad/s) — conservative for large rover
+
+      # Sampling noise (std dev for trajectory perturbation)
+      vx_std: 0.2          # perturbation on linear velocity
+      vy_std: 0.0          # no lateral perturbation
+      wz_std: 0.4          # perturbation on angular velocity
+
+      # Trajectory sampling
+      time_steps: 32       # horizon (32 steps = 3.2s at dt=0.1)
+      model_dt: 0.1        # timestep (seconds)
+      iteration_count: 4   # rollout iterations (4-10 good for skid-steer)
+      batch_size: 1        # batch size (1 = standard)
+      temperature: 0.0     # noise for exploration
+      gamma: 1.0           # discount factor
+
+      # Critics (each scored with .scale weight)
+      critics: ["PreferForward", "PathFollowed", "PathAngle", "GoalAngle", "Obstacles"]
+
+      # Critic weights (.scale = importance)
+      PreferForward.scale: 1.5
+      PathFollowed.scale: 2.0
+      PathAngle.scale: 1.0
+      GoalAngle.scale: 1.0
+      Obstacles.scale: 25.0
+      Obstacles.threshold_to_consider: 0.5
+      Obstacles.cost_scaling_factor: 10.0
+      Obstacles.collision_margin_distance: 0.10
+
+      visualize: true
+      trajectory_step: 4
+      enforce_path_inversion: true
+      prune_distance: 2.0
+      retry_attempt_limit: 3
+      transform_tolerance: 0.5
+
+
+# Velocity smoother - smooths out cmd_vel commands for skid steer
+velocity_smoother:
+  ros__parameters:
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.5, 0.0, 0.5]     # [x, y, theta]
+    min_velocity: [-0.5, 0.0, -0.5]
+    max_accel: [0.3, 0.0, 0.5]
+    max_decel: [-0.3, 0.0, -0.5]
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
