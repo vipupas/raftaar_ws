@@ -164,17 +164,6 @@ only be exercised on the robot.
 - `invert_yaw_rate = True` is derived from the ENU/NED convention
   difference, not from an observed hardware test.
 
-## Git conventions
-
-**No AI attribution in git history.** Do not add `Co-Authored-By: Claude`,
-"Generated with Claude Code", or any similar trailer or footer to commit
-messages or pull request bodies. The work is authored by the repository's
-maintainers. `.claude/settings.json` enforces this via `attribution`, but
-honour it regardless of whether that setting is loaded.
-
-Commit messages themselves should stay as they are: explain *why* a change
-was made and what would have gone wrong without it, not just what changed.
-
 ## Style
 
 Match the existing code: `snake_case`, docstrings that explain *why* a
