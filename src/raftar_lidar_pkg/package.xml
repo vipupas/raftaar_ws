@@ -5,6 +5,9 @@
   <version>0.0.0</version>
   <description>LiDAR obstacle avoidance for the Raftaar ArduPilot rover</description>
   <maintainer email="s.pvimalpratap9458@gmail.com">Vip</maintainer>
+  <maintainer email="ayushgoyal8178@gmail.com">Ayush Goyal</maintainer>
+  <author email="s.pvimalpratap9458@gmail.com">Vip</author>
+  <author email="ayushgoyal8178@gmail.com">Ayush Goyal</author>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>

@@ -20,8 +20,10 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='Vip',
-    maintainer_email='s.pvimalpratap9458@gmail.com',
+    author='Vip, Ayush Goyal',
+    author_email='s.pvimalpratap9458@gmail.com, ayushgoyal8178@gmail.com',
+    maintainer='Vip, Ayush Goyal',
+    maintainer_email='s.pvimalpratap9458@gmail.com, ayushgoyal8178@gmail.com',
     description='LiDAR obstacle avoidance for the Raftaar ArduPilot rover',
     license='Apache-2.0',
     extras_require={
