@@ -1,0 +1,27 @@
+# One-command development environment.
+#
+#   cd docker
+#   docker compose up -d          # build the image and start the container
+#   docker compose exec dev bash  # get a shell inside it
+#
+# The whole workspace is mounted at /ws, so edits made on your machine are
+# visible inside the container immediately - no rebuild needed to test a
+# code change.
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: raftaar-dev
+    container_name: raftaar-dev
+    volumes:
+      - ..:/ws
+    working_dir: /ws
+    environment:
+      # Confine DDS to this container. Without it, nodes here could
+      # discover - and command - a real rover on the same network.
+      - ROS_LOCALHOST_ONLY=1
+    # No restart policy on purpose: this container should never come back
+    # by itself. See docker/README.md.
+    command: sleep infinity
